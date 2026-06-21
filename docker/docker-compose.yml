@@ -1,0 +1,37 @@
+services:
+  fl-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    ports:
+      - "8080:8080" # Flower gRPC
+      - "8000:8000" # FastAPI
+    volumes:
+      - ../checkpoints:/app/checkpoints
+      - ../results:/app/results
+    environment:
+      - SERVER_ADDRESS=0.0.0.0:8080
+
+  client-0:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.client
+    environment:
+      - CLIENT_ID=0
+      - SERVER_ADDRESS=fl-server:8080
+    depends_on:
+      - fl-server
+    volumes:
+      - ../ML-Aided-NR-V2X-QoS-Predictions:/app/ML-Aided-NR-V2X-QoS-Predictions
+
+  client-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.client
+    environment:
+      - CLIENT_ID=1
+      - SERVER_ADDRESS=fl-server:8080
+    depends_on:
+      - fl-server
+    volumes:
+      - ../ML-Aided-NR-V2X-QoS-Predictions:/app/ML-Aided-NR-V2X-QoS-Predictions

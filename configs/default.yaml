@@ -1,0 +1,32 @@
+data:
+  dataset_path: "./ML-Aided-NR-V2X-QoS-Predictions/dataset.csv"
+  feature_cols: ["throughput", "sinr", "dlpathloss", "delay", "jitter"]
+  target_cols: ["throughput", "delay"]
+  filter_len: 10
+  window_len: 15
+  future_win_len: 5
+  stride: 5
+
+model:
+  input_size: 5
+  hidden_size: 1024
+  num_layers: 3
+  dropout: 0.3
+  bidirectional: false
+
+training:
+  batch_size: 64
+  learning_rate: 0.001
+  local_epochs: 100
+
+federation:
+  num_clients: 7
+  num_rounds: 50
+  fraction_fit: 0.7
+  min_fit_clients: 5
+
+deployment:
+  checkpoint_dir: "./checkpoints"
+  results_dir: "./results"
+  api_host: "0.0.0.0"
+  api_port: 8000
