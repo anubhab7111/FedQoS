@@ -1,1 +1,6 @@
 myenv/
+
+# Ignore Python bytecode caches
+__pycache__/
+*.py[cod]
+

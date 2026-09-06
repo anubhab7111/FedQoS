@@ -1,4 +1,9 @@
 import os
+import sys
+
+# Ensure project root is on sys.path so `from src...` imports work
+# when running this script directly (e.g. `python scripts/run_server.py`).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import yaml
 import torch
 import torch.nn as nn
