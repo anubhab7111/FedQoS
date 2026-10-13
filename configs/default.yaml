@@ -1,32 +1,42 @@
+seed: 42
+
 data:
   dataset_path: "./ML-Aided-NR-V2X-QoS-Predictions/dataset.csv"
   feature_cols: ["throughput", "sinr", "dlpathloss", "delay", "jitter"]
   target_cols: ["throughput", "delay"]
+  smooth_cols: ["sinr", "dlpathloss", "jitter"]  # rolling-mean smoothed; targets are left raw
   filter_len: 10
-  window_len: 15
+  run_cols: ["mcs", "pktsize", "power"]  # a new simulation run starts where any of these change (or a new source file begins)
+  max_position_step: 60  # a run's last row is dropped if its X/Y jumps further than this (end-of-log marker)
+  drop_zero_runs: true  # drop runs where every target value is 0 (failed simulations)
+  window_len: 30
   future_win_len: 5
   stride: 5
+  val_ratio: 0.2   # share of each run used for validation (picks the best round)
+  test_ratio: 0.2  # share of each run used for testing (reporting only)
+  noise_level: 0.0  # Gaussian noise augmentation on training windows only; 0 disables
 
 model:
   input_size: 5
-  hidden_size: 1024
-  num_layers: 3
-  dropout: 0.3
+  hidden_size: 32
+  num_layers: 1
+  dropout: 0.3  # only applied between LSTM layers, so unused with num_layers: 1
   bidirectional: false
 
 training:
   batch_size: 64
   learning_rate: 0.001
-  local_epochs: 100
+  local_epochs: 2
 
 federation:
   num_clients: 7
-  num_rounds: 50
+  num_rounds: 200
   fraction_fit: 0.7
   min_fit_clients: 5
 
 deployment:
   checkpoint_dir: "./checkpoints"
   results_dir: "./results"
+  inference_checkpoint: "global_model_best.pt"  # or global_model_final.pt
   api_host: "0.0.0.0"
   api_port: 8000

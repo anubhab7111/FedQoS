@@ -40,3 +40,15 @@ class LSTM(nn.Module):
         # Reshape to (batch, future_window_len, num_target_features)
         out = out.view(x.size(0), self.future_window_len, self.num_target_features)
         return out
+
+def build_model(config):
+    """Build the LSTM from a loaded config. Every entry point must use this so architectures match."""
+    return LSTM(
+        input_size=config["model"]["input_size"],
+        num_target_features=len(config["data"]["target_cols"]),
+        future_window_len=config["data"]["future_win_len"],
+        hidden_size=config["model"]["hidden_size"],
+        num_layers=config["model"]["num_layers"],
+        dropout=config["model"]["dropout"],
+        bidirectional=config["model"]["bidirectional"]
+    )

@@ -14,52 +14,68 @@ class QosDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-def sliding_window_augmentation(df, cols, indices, future_window_len=1, L=100, s=10, add_noise=True, noise_level=0.02):
-    """Extract sliding windows and optionally add noise for augmentation."""
-    X = df[cols].values
-    T, D = X.shape
-    
-    n_windows = max(0, (T - L - future_window_len) // s)
-    if n_windows <= 0:
-        return np.array([]), np.array([])
+def create_autoregressive_dataset(data, cols, indices, future_window_len=1, window_len=100, stride=10):
+    """Extract sliding windows and the future target values that follow each one.
 
-    windows = np.zeros((n_windows, L, D))
+    Returns clean windows only. Noise augmentation must be applied after the
+    train/test split (see `augment_with_noise`), otherwise noisy copies of test
+    windows end up in the training data.
+
+    `data` must be a single simulation run; use `create_run_datasets` for the
+    full dataset.
+    """
+    X = data[cols].values
+    T, D = X.shape
+
+    n_windows = max(0, (T - window_len - future_window_len) // stride + 1)
+    windows = np.zeros((n_windows, window_len, D))
     targets = np.zeros((n_windows, future_window_len, len(indices)))
-    
-    col_stds = df[cols].std().values
 
     for i in range(n_windows):
-        start = i * s
-        windows[i] = X[start : start + L].copy()
-        targets[i] = X[start + L : start + L + future_window_len, indices].copy()
-
-        if add_noise:
-            # Note: In the notebook, noise was added to a separate copy. 
-            # This function can be called twice or modified. 
-            # For simplicity, we'll let the orchestrator handle the noise copy.
-            pass
+        start = i * stride
+        windows[i] = X[start : start + window_len]
+        targets[i] = X[start + window_len : start + window_len + future_window_len, indices]
 
     return windows, targets
 
-def create_autoregressive_dataset(data, cols, indices, future_window_len=1, window_len=100, stride=10, add_noise=True, noise_level=0.02):
-    """Orchestrate window creation and augmentation."""
-    windows, targets = sliding_window_augmentation(
-        data, cols, indices, future_window_len=future_window_len, L=window_len, s=stride, add_noise=False
-    )
-    
-    if add_noise:
-        windows_noisy, targets_noisy = sliding_window_augmentation(
-            data, cols, indices, future_window_len=future_window_len, L=window_len, s=stride, add_noise=False
-        )
-        # Add noise to the copies
-        col_stds = data[cols].std().values
-        for i in range(len(windows_noisy)):
-            noise_X = np.random.randn(*windows_noisy[i].shape) * (col_stds * noise_level)
-            windows_noisy[i] += noise_X
-            noise_y = np.random.randn(*targets_noisy[i].shape) * (col_stds[indices] * noise_level)
-            targets_noisy[i] += noise_y
-            
-        windows = np.concatenate([windows, windows_noisy], axis=0)
-        targets = np.concatenate([targets, targets_noisy], axis=0)
-        
-    return windows, targets
+def augment_with_noise(windows, targets, indices, noise_level=0.02, rng=None):
+    """Return a noisy copy of the given windows and targets.
+
+    Noise is Gaussian, scaled by the per-feature std of the given windows.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    col_stds = windows.reshape(-1, windows.shape[-1]).std(axis=0)
+    windows_noisy = windows + rng.standard_normal(windows.shape) * (col_stds * noise_level)
+    targets_noisy = targets + rng.standard_normal(targets.shape) * (col_stds[indices] * noise_level)
+    return windows_noisy, targets_noisy
+
+def create_run_datasets(data, cols, indices, future_window_len=1, window_len=100, stride=10):
+    """Extract windows run by run and label each sample train / val / test.
+
+    `data` needs a `run_id` column and a row-level `split` column (see
+    `label_splits`). Windows never cross a run boundary. A sample belongs to the
+    split that holds all of its target rows; samples whose targets straddle a
+    split boundary are dropped. Because the splits are chronological, a training
+    sample lies entirely in the training rows, so no validation or test row is
+    ever seen in training. The input window of a validation or test sample may
+    reach back into earlier rows, as it would in deployment.
+
+    Returns (windows, targets, splits, runs), where `splits` holds the split
+    name and `runs` the run id of every sample.
+    """
+    windows, targets, splits, runs = [], [], [], []
+    for run_id, run in data.groupby('run_id', sort=True):
+        X, y = create_autoregressive_dataset(run, cols, indices, future_window_len, window_len, stride)
+        if len(X) == 0:
+            continue  # run shorter than one sample
+
+        row_split = run['split'].values
+        target_start = np.arange(len(X)) * stride + window_len
+        first, last = row_split[target_start], row_split[target_start + future_window_len - 1]
+        keep = first == last
+
+        windows.append(X[keep]); targets.append(y[keep]); splits.append(first[keep])
+        runs.append(np.full(keep.sum(), run_id))
+
+    return np.concatenate(windows), np.concatenate(targets), np.concatenate(splits), np.concatenate(runs)

@@ -1,10 +1,13 @@
 import torch
-import yaml
 import os
 import numpy as np
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from api.schemas import PredictionRequest, PredictionResponse
-from src.models.lstm import LSTM
+from src.config import load_config
+from src.data.pipeline import get_smooth_cols
+from src.data.preprocessing import smooth_features
+from src.models.lstm import build_model
 import joblib # for loading scalers
 
 app = FastAPI(title="NR-V2X QoS Prediction API")
@@ -19,19 +22,11 @@ config = None
 def load_resources():
     global model, feature_scaler, target_scaler, config
     
-    config_path = os.getenv("CONFIG_PATH", "configs/default.yaml")
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    
-    checkpoint_path = os.path.join(config["deployment"]["checkpoint_dir"], "global_model.pt")
+    config = load_config()
+
+    checkpoint_path = os.path.join(config["deployment"]["checkpoint_dir"], config["deployment"].get("inference_checkpoint", "global_model_best.pt"))
     if os.path.exists(checkpoint_path):
-        model = LSTM(
-            input_size=config["model"]["input_size"],
-            num_target_features=len(config["data"]["target_cols"]),
-            future_window_len=config["data"]["future_win_len"],
-            hidden_size=config["model"]["hidden_size"],
-            num_layers=config["model"]["num_layers"]
-        )
+        model = build_model(config)
         model.load_state_dict(torch.load(checkpoint_path, map_location=torch.device('cpu')))
         model.eval()
     
@@ -43,18 +38,43 @@ def load_resources():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "model_loaded": model is not None}
+    ready = model is not None and feature_scaler is not None and target_scaler is not None
+    return {
+        "status": "healthy" if ready else "not_ready",
+        "model_loaded": model is not None,
+        "scalers_loaded": feature_scaler is not None and target_scaler is not None,
+    }
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict(request: PredictionRequest):
     if model is None or feature_scaler is None or target_scaler is None:
         raise HTTPException(status_code=503, detail="Model or scalers not loaded")
     
+    # Validate before the try block so client errors are not turned into 500s.
+    # The model uses the last `window_len` rows. Up to `filter_len - 1` earlier rows
+    # may be sent as well, so the rolling mean of the first rows has its full history.
+    data_cfg = config["data"]
+    window_len, input_size = data_cfg["window_len"], config["model"]["input_size"]
+    max_rows = window_len + data_cfg["filter_len"] - 1
     try:
-        window_data = np.array(request.window)
-        if window_data.shape != (config["data"]["window_len"], config["model"]["input_size"]):
-             raise HTTPException(status_code=400, detail=f"Invalid window shape. Expected ({config['data']['window_len']}, {config['model']['input_size']})")
-        
+        window_data = np.array(request.window, dtype=float)
+    except ValueError:
+        window_data = None
+    if (window_data is None or window_data.ndim != 2 or window_data.shape[1] != input_size
+            or not window_len <= window_data.shape[0] <= max_rows):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid window shape. Expected {window_len} to {max_rows} rows of {input_size} values"
+        )
+    if not np.isfinite(window_data).all():
+        raise HTTPException(status_code=400, detail="Window contains NaN or infinite values")
+
+    try:
+        # Smooth the raw measurements exactly as the training pipeline does
+        frame = pd.DataFrame(window_data, columns=data_cfg["feature_cols"])
+        frame = smooth_features(frame, get_smooth_cols(data_cfg), data_cfg["filter_len"])
+        window_data = frame.values[-window_len:]
+
         # Scale input
         window_scaled = feature_scaler.transform(window_data)
         window_tensor = torch.tensor(window_scaled, dtype=torch.float32).unsqueeze(0)
@@ -65,10 +85,13 @@ def predict(request: PredictionRequest):
         
         # Inverse scale output
         prediction_unscaled = target_scaler.inverse_transform(prediction_scaled)
+        # Throughput and delay cannot be negative; the unconstrained model output can be
+        prediction_unscaled = np.clip(prediction_unscaled, 0, None)
         
+        target_cols = config["data"]["target_cols"]
         return PredictionResponse(
-            throughput=prediction_unscaled[:, 0].tolist(),
-            delay=prediction_unscaled[:, 1].tolist()
+            throughput=prediction_unscaled[:, target_cols.index("throughput")].tolist(),
+            delay=prediction_unscaled[:, target_cols.index("delay")].tolist()
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

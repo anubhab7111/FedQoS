@@ -1,3 +1,15 @@
+# The number of client services must match federation.num_clients in the config:
+# the server waits until that many clients are connected before starting.
+x-client: &client
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.client
+  depends_on:
+    - fl-server
+  volumes:
+    - ../ML-Aided-NR-V2X-QoS-Predictions:/app/ML-Aided-NR-V2X-QoS-Predictions
+    - ../results:/app/results
+
 services:
   fl-server:
     build:
@@ -5,33 +17,62 @@ services:
       dockerfile: docker/Dockerfile.server
     ports:
       - "8080:8080" # Flower gRPC
-      - "8000:8000" # FastAPI
     volumes:
       - ../checkpoints:/app/checkpoints
       - ../results:/app/results
     environment:
       - SERVER_ADDRESS=0.0.0.0:8080
 
-  client-0:
+  # Inference API. Reports "not_ready" on /health until training has written
+  # checkpoints/global_model_best.pt; restart this service after training finishes.
+  api:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.client
+      dockerfile: docker/Dockerfile.server
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000" # FastAPI
+    volumes:
+      - ../checkpoints:/app/checkpoints
+
+  client-0:
+    <<: *client
     environment:
       - CLIENT_ID=0
       - SERVER_ADDRESS=fl-server:8080
-    depends_on:
-      - fl-server
-    volumes:
-      - ../ML-Aided-NR-V2X-QoS-Predictions:/app/ML-Aided-NR-V2X-QoS-Predictions
 
   client-1:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.client
+    <<: *client
     environment:
       - CLIENT_ID=1
       - SERVER_ADDRESS=fl-server:8080
-    depends_on:
-      - fl-server
-    volumes:
-      - ../ML-Aided-NR-V2X-QoS-Predictions:/app/ML-Aided-NR-V2X-QoS-Predictions
+
+  client-2:
+    <<: *client
+    environment:
+      - CLIENT_ID=2
+      - SERVER_ADDRESS=fl-server:8080
+
+  client-3:
+    <<: *client
+    environment:
+      - CLIENT_ID=3
+      - SERVER_ADDRESS=fl-server:8080
+
+  client-4:
+    <<: *client
+    environment:
+      - CLIENT_ID=4
+      - SERVER_ADDRESS=fl-server:8080
+
+  client-5:
+    <<: *client
+    environment:
+      - CLIENT_ID=5
+      - SERVER_ADDRESS=fl-server:8080
+
+  client-6:
+    <<: *client
+    environment:
+      - CLIENT_ID=6
+      - SERVER_ADDRESS=fl-server:8080

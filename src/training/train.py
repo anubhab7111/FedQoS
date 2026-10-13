@@ -4,9 +4,10 @@ import numpy as np
 from sklearn.metrics import r2_score
 
 def train(model, trainloader, criterion, optimizer, epochs, device, scheduler=None):
-    """Local training loop."""
+    """Local training loop. Returns the mean per-sample loss of the last epoch."""
     model.to(device)
     model.train()
+    epoch_loss = float("nan")
     
     for epoch in range(epochs):
         epoch_loss = 0
@@ -17,15 +18,16 @@ def train(model, trainloader, criterion, optimizer, epochs, device, scheduler=No
             loss = criterion(pred, y)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
+            # Weight by batch size: the last batch is usually smaller
+            epoch_loss += loss.item() * len(X)
 
         if scheduler is not None:
             scheduler.step()
     
-    return epoch_loss / len(trainloader)
+    return epoch_loss / len(trainloader.dataset)
 
 def validate(model, valloader, criterion, target_scaler, device):
-    """Validation loop with R² computation."""
+    """Validation loop. Returns the mean per-sample loss and the per-target R² in original units."""
     model.to(device)
     model.eval()
     epoch_loss = 0
@@ -37,7 +39,8 @@ def validate(model, valloader, criterion, target_scaler, device):
             X, y = X.to(device), y.to(device)
             pred = model(X)
             loss = criterion(pred, y)
-            epoch_loss += loss.item()
+            # Weight by batch size: the last batch is usually smaller
+            epoch_loss += loss.item() * len(X)
 
             pred_cpu = pred.cpu().numpy()
             y_cpu = y.cpu().numpy()
@@ -49,7 +52,7 @@ def validate(model, valloader, criterion, target_scaler, device):
             all_pred_unscaled.append(target_scaler.inverse_transform(pred_reshaped))
             all_targets_unscaled.append(target_scaler.inverse_transform(y_reshaped))
 
-    avg_loss = epoch_loss / len(valloader)
+    avg_loss = epoch_loss / len(valloader.dataset)
     final_preds = np.concatenate(all_pred_unscaled)
     final_targets = np.concatenate(all_targets_unscaled)
 

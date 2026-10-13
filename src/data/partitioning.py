@@ -1,65 +1,92 @@
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader
-from src.data.dataset import QosDataset
+from src.data.dataset import QosDataset, augment_with_noise
 
-def create_federated_data(all_windows, all_targets, num_clients, batch_size, train_test_split_ratio=0.8):
-    """Split data across clients and prepare dataloaders."""
-    client_loaders = []
-    global_test_X_parts = []
-    global_test_y_parts = []
-    
-    num_samples = len(all_windows)
-    samples_per_client = num_samples // num_clients
+def _scale(scaler, arr):
+    """Apply a fitted scaler to a (samples, timesteps, features) array."""
+    return scaler.transform(arr.reshape(-1, arr.shape[-1])).reshape(arr.shape)
 
+def assign_runs_to_clients(runs, splits, num_clients):
+    """Give each client a contiguous group of whole runs with a similar number of training samples.
+
+    Returns a dict mapping run id to client index.
+    """
+    run_ids = np.unique(runs)
+    if len(run_ids) < num_clients:
+        raise ValueError(f"Only {len(run_ids)} runs for {num_clients} clients. Reduce num_clients.")
+    counts = np.array([np.sum((runs == r) & (splits == 'train')) for r in run_ids])
+    # Position of each run's midpoint in the cumulative training-sample count
+    midpoints = (np.cumsum(counts) - counts / 2) / counts.sum()
+    clients = np.minimum((midpoints * num_clients).astype(int), num_clients - 1)
+    return dict(zip(run_ids, clients))
+
+def create_federated_data(all_windows, all_targets, splits, runs, num_clients, batch_size, target_indices,
+                          noise_level=0.02, seed=None):
+    """Split data across clients and prepare dataloaders.
+
+    `splits` and `runs` come from `create_run_datasets`: every sample already
+    carries its train/val/test label and the simulation run it was cut from.
+    Each client gets a contiguous group of whole runs, so every client holds
+    train, validation and test samples from the same runs. Noise augmentation
+    is applied to the training windows only. All clients share one feature
+    scaler and one target scaler, fitted on the clean training windows of all
+    clients.
+
+    The validation split is for model selection (e.g. picking the best round);
+    the test split must only be used for reporting.
+
+    Returns (client_loaders, global_loaders, scalers).
+    """
+    rng = np.random.default_rng(seed)
+    run_to_client = assign_runs_to_clients(runs, splits, num_clients)
+    sample_client = np.array([run_to_client[r] for r in runs])
+
+    client_splits = []
     for i in range(num_clients):
-        start_idx = i * samples_per_client
-        end_idx = (i + 1) * samples_per_client if i < num_clients - 1 else num_samples
+        split = {}
+        for name in ('train', 'val', 'test'):
+            mask = (sample_client == i) & (splits == name)
+            split[name] = (all_windows[mask], all_targets[mask])
+        if any(len(X) == 0 for X, _ in split.values()):
+            raise ValueError(
+                f"Client {i} has an empty train, val or test split. "
+                f"Reduce num_clients, stride or window sizes."
+            )
+        client_splits.append(split)
 
-        client_windows = all_windows[start_idx:end_idx]
-        client_targets = all_targets[start_idx:end_idx]
+    # Shared scalers, fitted on clean training data only
+    feature_scaler = MinMaxScaler()
+    feature_scaler.fit(np.concatenate([s['train'][0] for s in client_splits]).reshape(-1, all_windows.shape[-1]))
+    target_scaler = MinMaxScaler()
+    target_scaler.fit(np.concatenate([s['train'][1] for s in client_splits]).reshape(-1, all_targets.shape[-1]))
 
-        if len(client_windows) < 2:
-            continue
+    client_loaders = []
+    global_parts = {'val': [], 'test': []}
 
-        # Chronological split
-        X_train, X_test, y_train, y_test = train_test_split(
-            client_windows, client_targets, train_size=train_test_split_ratio, shuffle=False
-        )
+    for split in client_splits:
+        X_train, y_train = split['train']
+        if noise_level:
+            X_noisy, y_noisy = augment_with_noise(X_train, y_train, target_indices, noise_level, rng)
+            X_train = np.concatenate([X_train, X_noisy], axis=0)
+            y_train = np.concatenate([y_train, y_noisy], axis=0)
 
-        # Scale input features
-        scaler = MinMaxScaler()
-        n_train, n_timesteps, n_features = X_train.shape
-        X_train_scaled = scaler.fit_transform(X_train.reshape(-1, n_features)).reshape(n_train, n_timesteps, n_features)
-        X_test_scaled = scaler.transform(X_test.reshape(-1, n_features)).reshape(X_test.shape[0], n_timesteps, n_features)
+        train_dataset = QosDataset(_scale(feature_scaler, X_train), _scale(target_scaler, y_train))
+        loaders = {'train': DataLoader(train_dataset, batch_size=batch_size, shuffle=True)}
 
-        # Scale targets
-        target_scaler = MinMaxScaler()
-        n_train_y, n_timesteps_y, n_features_y = y_train.shape
-        y_train_scaled = target_scaler.fit_transform(y_train.reshape(-1, n_features_y)).reshape(n_train_y, n_timesteps_y, n_features_y)
-        y_test_scaled = target_scaler.transform(y_test.reshape(-1, n_features_y)).reshape(y_test.shape[0], n_timesteps_y, n_features_y)
+        for name in ('val', 'test'):
+            X_scaled = _scale(feature_scaler, split[name][0])
+            y_scaled = _scale(target_scaler, split[name][1])
+            loaders[name] = DataLoader(QosDataset(X_scaled, y_scaled), batch_size=batch_size, shuffle=False)
+            global_parts[name].append((X_scaled, y_scaled))
 
-        train_dataset = QosDataset(X_train_scaled, y_train_scaled)
-        test_dataset = QosDataset(X_test_scaled, y_test_scaled)
+        client_loaders.append(loaders)
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    # Create global val and test sets
+    global_loaders = {}
+    for name, parts in global_parts.items():
+        dataset = QosDataset(np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]))
+        global_loaders[name] = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
-        client_loaders.append({
-            'train': train_loader,
-            'test': test_loader,
-            'target_scaler': target_scaler,
-            'feature_scaler': scaler
-        })
-
-        global_test_X_parts.append(X_test_scaled)
-        global_test_y_parts.append(y_test_scaled)
-
-    # Create global test set
-    global_test_X = np.concatenate(global_test_X_parts, axis=0)
-    global_test_y = np.concatenate(global_test_y_parts, axis=0)
-    global_test_dataset = QosDataset(global_test_X, global_test_y)
-    global_test_loader = DataLoader(global_test_dataset, batch_size=batch_size, shuffle=False)
-
-    return client_loaders, global_test_loader
+    scalers = {"feature": feature_scaler, "target": target_scaler}
+    return client_loaders, global_loaders, scalers

@@ -2,20 +2,21 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# The containers have no GPU access, so install the much smaller CPU-only torch build.
+RUN pip install --no-cache-dir torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
 EXPOSE 8080 8000
 
 ENV PYTHONPATH=/app
+# Several containers share the host CPUs; without a cap every process starts one
+# thread per core and rounds become ~30x slower.
+ENV OMP_NUM_THREADS=2
 ENV CONFIG_PATH=configs/default.yaml
 
-# In a real deployment, you might use a process manager like supervisord
-# For now, we'll assume the entry point script handles the server logic
+# Runs the FL server. The inference API uses this same image with a different
+# command (see the `api` service in docker-compose.yml).
 CMD ["python", "scripts/run_server.py"]

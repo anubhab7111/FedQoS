@@ -1,0 +1,11 @@
+.git
+myenv/
+notebooks/
+plots/
+client_results/
+results/
+checkpoints/
+**/__pycache__/
+**/.ipynb_checkpoints/
+.pytest_cache/
+.scratch/

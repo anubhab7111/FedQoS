@@ -1,27 +1,24 @@
-import torch
-import yaml
 import os
-from src.models.lstm import LSTM
+import sys
+
+# Ensure project root is on sys.path so `from src...` imports work
+# when running this script directly (e.g. `python scripts/export_model.py`).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import torch
+from src.config import load_config
+from src.models.lstm import build_model
 
 def export_to_onnx():
-    config_path = os.getenv("CONFIG_PATH", "configs/default.yaml")
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+    config = load_config()
     
-    checkpoint_path = os.path.join(config["deployment"]["checkpoint_dir"], "global_model.pt")
-    onnx_path = os.path.join(config["deployment"]["checkpoint_dir"], "global_model.onnx")
+    checkpoint_path = os.path.join(config["deployment"]["checkpoint_dir"], config["deployment"].get("inference_checkpoint", "global_model_best.pt"))
+    onnx_path = os.path.splitext(checkpoint_path)[0] + ".onnx"
     
     if not os.path.exists(checkpoint_path):
         print(f"No checkpoint found at {checkpoint_path}")
         return
 
-    model = LSTM(
-        input_size=config["model"]["input_size"],
-        num_target_features=len(config["data"]["target_cols"]),
-        future_window_len=config["data"]["future_win_len"],
-        hidden_size=config["model"]["hidden_size"],
-        num_layers=config["model"]["num_layers"]
-    )
+    model = build_model(config)
     model.load_state_dict(torch.load(checkpoint_path, map_location=torch.device('cpu')))
     model.eval()
 

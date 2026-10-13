@@ -4,69 +4,42 @@ import sys
 # Ensure project root is on sys.path so `from src...` imports work
 # when running this script directly (e.g. `python scripts/run_server.py`).
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import yaml
 import torch
 import torch.nn as nn
 import flwr as fl
 import joblib
-from src.data.preprocessing import load_dataset, impute_missing, smooth_features, select_features
-from src.data.dataset import create_autoregressive_dataset
-from src.data.partitioning import create_federated_data
-from src.models.lstm import LSTM
-from src.fl.utils import get_parameters
-from src.fl.server import create_strategy, get_evaluate_fn, get_on_fit_config_fn
+from src.config import load_config
+from src.data.pipeline import load_federated_data
+from src.models.lstm import build_model
+from src.fl.utils import get_parameters, set_seed
+from src.fl.server import GlobalEvaluator, create_strategy, get_on_fit_config_fn, BEST_CHECKPOINT, FINAL_CHECKPOINT
 
 def main():
-    config_path = os.getenv("CONFIG_PATH", "configs/default.yaml")
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    
+    config = load_config()
+    set_seed(config.get("seed"))
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(config["deployment"]["checkpoint_dir"], exist_ok=True)
     os.makedirs(config["deployment"]["results_dir"], exist_ok=True)
 
-    # Load and preprocess
-    df = load_dataset(config["data"]["dataset_path"])
-    df = impute_missing(df)
-    df = smooth_features(df, config["data"]["feature_cols"], config["data"]["filter_len"])
+    # Load, preprocess and partition (only the global val/test sets are used here)
+    _, global_loaders, scalers = load_federated_data(config)
     
-    # Create windows
-    target_indices = [config["data"]["feature_cols"].index(name) for name in config["data"]["target_cols"]]
-    windows, targets = create_autoregressive_dataset(
-        df, config["data"]["feature_cols"], target_indices,
-        future_window_len=config["data"]["future_win_len"],
-        window_len=config["data"]["window_len"],
-        stride=config["data"]["stride"]
-    )
-    
-    # Partition for global evaluation
-    client_loaders, global_test_loader = create_federated_data(
-        windows, targets, config["federation"]["num_clients"], config["training"]["batch_size"]
-    )
-    
-    # Save scalers from first client for inference (representative)
-    scalers = {
-        "feature": client_loaders[0]["feature_scaler"],
-        "target": client_loaders[0]["target_scaler"]
-    }
+    # Save the shared scalers for inference
     joblib.dump(scalers, os.path.join(config["deployment"]["checkpoint_dir"], "scalers.joblib"))
 
     # Initialize model
-    model = LSTM(
-        input_size=config["model"]["input_size"],
-        num_target_features=len(config["data"]["target_cols"]),
-        future_window_len=config["data"]["future_win_len"],
-        hidden_size=config["model"]["hidden_size"],
-        num_layers=config["model"]["num_layers"],
-        dropout=config["model"]["dropout"],
-        bidirectional=config["model"]["bidirectional"]
-    )
+    model = build_model(config)
     
     initial_parameters = fl.common.ndarrays_to_parameters(get_parameters(model))
     
-    # Server functions
-    evaluate_fn = get_evaluate_fn(
-        model, global_test_loader, nn.MSELoss(), client_loaders[0]["target_scaler"], device
+    # Server functions. The evaluator saves the best round (lowest validation
+    # loss) and the final round as it goes.
+    checkpoint_dir = config["deployment"]["checkpoint_dir"]
+    evaluate_fn = GlobalEvaluator(
+        model, global_loaders["val"], global_loaders["test"], nn.MSELoss(), scalers["target"], device,
+        config["data"]["target_cols"], checkpoint_dir=checkpoint_dir,
+        history_path=os.path.join(config["deployment"]["results_dir"], "server_history.csv")
     )
     on_fit_config_fn = get_on_fit_config_fn(config["training"]["local_epochs"])
     
@@ -87,9 +60,12 @@ def main():
         strategy=strategy,
     )
     
-    # Save final model
-    torch.save(model.state_dict(), os.path.join(config["deployment"]["checkpoint_dir"], "global_model.pt"))
-    print("Model saved.")
+    summary = evaluate_fn.summary()
+    if summary["best"] is None:
+        print("No training round completed; no model saved.")
+        return
+    print(f"Best round {summary['best']['round']} saved to {os.path.join(checkpoint_dir, BEST_CHECKPOINT)}: {summary['best']}")
+    print(f"Final round {summary['final']['round']} saved to {os.path.join(checkpoint_dir, FINAL_CHECKPOINT)}: {summary['final']}")
 
 if __name__ == "__main__":
     main()
